@@ -110,14 +110,15 @@ async def get_history(symbol: str, period: str = "1M"):
         return cached
     try:
         period_map = {
-            "1M": (365, "1month"),
-            "6M": (180, "6month"),
-            "YTD": (365, "ytd"),
-            "1Y": (365, "1year"),
-            "5Y": (260, "5year"),
+            "1M":  ("1day",  30),
+            "6M":  ("1day",  180),
+            "YTD": ("1day",  365),
+            "1Y":  ("1day",  365),
+            "5Y":  ("1week", 260),
         }
-        outputsize, _ = period_map.get(period.upper(), (30, "1month"))
-        interval = "1week" if period.upper() == "5Y" else "1day"
+        interval, outputsize = period_map.get(period.upper(), ("1day", 30))
+
+        # ดึง high, low, close ด้วย
         data = await td_get("/time_series", {
             "symbol": sym,
             "interval": interval,
@@ -126,8 +127,18 @@ async def get_history(symbol: str, period: str = "1M"):
         })
         if data.get("status") == "error" or "code" in data:
             return {"error": data.get("message", "No data")}
+
         values = data.get("values", [])
-        chart_data = [{"date": v["datetime"], "close": round(float(v["close"]), 2)} for v in values]
+        chart_data = [
+            {
+                "date":  v["datetime"],
+                "close": round(float(v["close"]), 2),
+                "high":  round(float(v["high"]), 2),
+                "low":   round(float(v["low"]), 2),
+                "open":  round(float(v["open"]), 2),
+            }
+            for v in values
+        ]
         result = {"symbol": sym, "period": period, "data": chart_data}
         set_cache(cache_key, result)
         return result
