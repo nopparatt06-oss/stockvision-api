@@ -1,12 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import yfinance as yf
 import httpx
 import threading
 import urllib.request
 import time as _time
-from datetime import datetime, timedelta
 
-AV_KEY = "TR15H1ZZCCT2AVVO"
 NEWS_API_KEY = "3d7fe42a10054f6ea8e05d93dc4348c7"
 
 app = FastAPI(title="StockVision API")
@@ -18,14 +17,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── In-memory cache ──────────────────────────
+# ── Cache ────────────────────────────────────
 _cache = {}
-CACHE_TTL = 60  # seconds
 
-def get_cache(key):
+def get_cache(key, ttl=300):
     if key in _cache:
         val, ts = _cache[key]
-        if _time.time() - ts < CACHE_TTL:
+        if _time.time() - ts < ttl:
             return val
     return None
 
@@ -44,37 +42,19 @@ def ping():
 
 
 @app.get("/price/{symbol}")
-async def get_price(symbol: str):
+def get_price(symbol: str):
     sym = symbol.upper()
-    cached = get_cache(f"price_{sym}")
+    cached = get_cache(f"p_{sym}", ttl=300)
     if cached:
         return cached
-
     try:
-        url = (
-            f"https://www.alphavantage.co/query"
-            f"?function=GLOBAL_QUOTE"
-            f"&symbol={sym}"
-            f"&apikey={AV_KEY}"
-        )
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(url)
-            data = r.json()
-
-        q = data.get("Global Quote", {})
-        print(f"AV response for {sym}: {data}", flush=True)
-        if not q or not q.get("05. price"):
-            # Check if rate limited
-            if "Information" in data or "Note" in data:
-                msg = data.get("Information", data.get("Note", "Rate limited"))
-                return {"error": f"Rate limited: {msg[:100]}"}
-            return {"error": f"Symbol {sym} not found", "raw": str(data)[:200]}
-
-        price = round(float(q["05. price"]), 2)
-        prev = round(float(q["08. previous close"]), 2)
-        chg_amt = round(float(q["09. change"]), 2)
-        chg_pct = round(float(q["10. change percent"].replace("%", "")), 2)
-
+        hist = yf.Ticker(sym).history(period="2d")
+        if hist.empty:
+            return {"error": f"Symbol {sym} not found"}
+        price = round(float(hist["Close"].iloc[-1]), 2)
+        prev  = round(float(hist["Close"].iloc[-2]), 2) if len(hist) >= 2 else price
+        chg_amt = round(price - prev, 2)
+        chg_pct = round(((price - prev) / prev) * 100, 2) if prev else 0
         result = {
             "symbol": sym,
             "price": price,
@@ -83,137 +63,110 @@ async def get_price(symbol: str):
             "changePct": chg_pct,
             "currency": "USD",
         }
-        set_cache(f"price_{sym}", result)
+        set_cache(f"p_{sym}", result)
         return result
-
     except Exception as e:
         return {"error": str(e)}
 
 
 @app.get("/prices")
-async def get_prices(symbols: str):
+def get_prices(symbols: str):
     sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     results = {}
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        for sym in sym_list:
-            cached = get_cache(f"price_{sym}")
-            if cached:
-                results[sym] = cached
-                continue
-            try:
-                url = (
-                    f"https://www.alphavantage.co/query"
-                    f"?function=GLOBAL_QUOTE"
-                    f"&symbol={sym}"
-                    f"&apikey={AV_KEY}"
-                )
-                r = await client.get(url)
-                data = r.json()
-                q = data.get("Global Quote", {})
-                if not q or not q.get("05. price"):
-                    results[sym] = {"error": "not found"}
-                    continue
-                price = round(float(q["05. price"]), 2)
-                prev = round(float(q["08. previous close"]), 2)
-                chg_pct = round(float(q["10. change percent"].replace("%", "")), 2)
-                res = {
-                    "symbol": sym,
-                    "price": price,
-                    "changePct": chg_pct,
-                    "change": round(price - prev, 2),
-                }
-                set_cache(f"price_{sym}", res)
-                results[sym] = res
-                _time.sleep(0.5)  # หลีกเลี่ยง rate limit
-            except Exception as e:
-                results[sym] = {"error": str(e)}
-
+    # แยก cached กับ uncached
+    uncached = [s for s in sym_list if not get_cache(f"p_{s}", ttl=300)]
+    for s in sym_list:
+        c = get_cache(f"p_{s}", ttl=300)
+        if c:
+            results[s] = c
+    if uncached:
+        try:
+            tickers = yf.Tickers(" ".join(uncached))
+            for sym in uncached:
+                try:
+                    hist = tickers.tickers[sym].history(period="2d")
+                    if hist.empty:
+                        results[sym] = {"error": "not found"}
+                        continue
+                    price = round(float(hist["Close"].iloc[-1]), 2)
+                    prev  = round(float(hist["Close"].iloc[-2]), 2) if len(hist) >= 2 else price
+                    chg_pct = round(((price - prev) / prev) * 100, 2) if prev else 0
+                    res = {
+                        "symbol": sym,
+                        "price": price,
+                        "changePct": chg_pct,
+                        "change": round(price - prev, 2),
+                    }
+                    set_cache(f"p_{sym}", res)
+                    results[sym] = res
+                except Exception as e:
+                    results[sym] = {"error": str(e)}
+        except Exception as e:
+            for sym in uncached:
+                if sym not in results:
+                    results[sym] = {"error": str(e)}
     return results
 
 
 @app.get("/history/{symbol}")
-async def get_history(symbol: str, period: str = "1M"):
+def get_history(symbol: str, period: str = "1M"):
     sym = symbol.upper()
-    cache_key = f"hist_{sym}_{period}"
-    cached = get_cache(cache_key)
+    cache_key = f"h_{sym}_{period}"
+    cached = get_cache(cache_key, ttl=3600)
     if cached:
         return cached
-
     try:
-        # Alpha Vantage: daily adjusted
-        outputsize = "compact" if period in ["1M", "6M"] else "full"
-        url = (
-            f"https://www.alphavantage.co/query"
-            f"?function=TIME_SERIES_DAILY"
-            f"&symbol={sym}"
-            f"&outputsize={outputsize}"
-            f"&apikey={AV_KEY}"
-        )
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(url)
-            data = r.json()
-
-        ts = data.get("Time Series (Daily)", {})
-        if not ts:
-            return {"error": "No data"}
-
-        # Filter by period
-        now = datetime.now()
-        period_days = {
-            "1M": 30, "6M": 180, "YTD": (now - datetime(now.year, 1, 1)).days,
-            "1Y": 365, "5Y": 365 * 5
+        period_map = {
+            "1M": "1mo", "6M": "6mo", "YTD": "ytd",
+            "1Y": "1y",  "5Y": "5y"
         }
-        days = period_days.get(period.upper(), 30)
-        cutoff = now - timedelta(days=days)
-
-        data_list = []
-        for date_str, vals in sorted(ts.items()):
-            date = datetime.strptime(date_str, "%Y-%m-%d")
-            if date >= cutoff:
-                data_list.append({
-                    "date": date_str,
-                    "close": round(float(vals["4. close"]), 2)
-                })
-
-        result = {"symbol": sym, "period": period, "data": data_list}
+        yf_period = period_map.get(period.upper(), "1mo")
+        hist = yf.Ticker(sym).history(period=yf_period)
+        if hist.empty:
+            return {"error": "No data"}
+        data = [
+            {"date": str(d.date()), "close": round(float(c), 2)}
+            for d, c in zip(hist.index, hist["Close"])
+        ]
+        result = {"symbol": sym, "period": period, "data": data}
         set_cache(cache_key, result)
         return result
-
     except Exception as e:
         return {"error": str(e)}
 
 
 @app.get("/news/{symbol}")
 async def get_news(symbol: str, name: str = ""):
+    cache_key = f"news_{symbol.upper()}"
+    cached = get_cache(cache_key, ttl=1800)
+    if cached:
+        return cached
     try:
         query = f"{symbol} {name} stock".strip()
         url = (
             f"https://newsapi.org/v2/everything"
-            f"?q={query}"
-            f"&language=en"
-            f"&sortBy=publishedAt"
-            f"&pageSize=10"
+            f"?q={query}&language=en&sortBy=publishedAt&pageSize=8"
             f"&apiKey={NEWS_API_KEY}"
         )
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(url)
             data = r.json()
-
         if data.get("status") == "ok":
-            articles = []
-            for a in data.get("articles", []):
-                articles.append({
+            articles = [
+                {
                     "title": a.get("title", ""),
                     "description": a.get("description", ""),
                     "url": a.get("url", ""),
                     "urlToImage": a.get("urlToImage", ""),
                     "publishedAt": a.get("publishedAt", ""),
                     "source": a.get("source", {}).get("name", ""),
-                })
-            return {"symbol": symbol.upper(), "articles": articles}
-        else:
-            return {"error": data.get("message", "NewsAPI error"), "articles": []}
+                }
+                for a in data.get("articles", [])
+            ]
+            result = {"symbol": symbol.upper(), "articles": articles}
+            set_cache(cache_key, result)
+            return result
+        return {"error": data.get("message", "NewsAPI error"), "articles": []}
     except Exception as e:
         return {"error": str(e), "articles": []}
 
