@@ -13,7 +13,6 @@ NEWS_API_KEY = "3d7fe42a10054f6ea8e05d93dc4348c7"
 app = FastAPI(title="StockVision API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ── Cache ────────────────────────────────────
 _cache = {}
 
 def get_cache(key, ttl=600):
@@ -26,9 +25,7 @@ def get_cache(key, ttl=600):
 def set_cache(key, val):
     _cache[key] = (val, _time.time())
 
-
 def fetch_yf(sym, period="2d", retries=3):
-    """Fetch yfinance with browser headers + retry + random delay"""
     for i in range(retries):
         try:
             _time.sleep(random.uniform(1.0, 2.5))
@@ -48,16 +45,13 @@ def fetch_yf(sym, period="2d", retries=3):
             else:
                 raise e
     return None
-
-
-@app.get("/")
+    @app.get("/")
 def root():
     return {"status": "ok", "message": "StockVision API is running 🚀"}
 
 @app.get("/ping")
 def ping():
     return {"pong": True}
-
 
 @app.get("/price/{symbol}")
 def get_price(symbol: str):
@@ -70,7 +64,7 @@ def get_price(symbol: str):
         if hist is None or hist.empty:
             return {"error": f"Symbol {sym} not found"}
         price = round(float(hist["Close"].iloc[-1]), 2)
-        prev  = round(float(hist["Close"].iloc[-2]), 2) if len(hist) >= 2 else price
+        prev = round(float(hist["Close"].iloc[-2]), 2) if len(hist) >= 2 else price
         chg_pct = round(((price - prev) / prev) * 100, 2) if prev else 0
         result = {
             "symbol": sym,
@@ -84,7 +78,6 @@ def get_price(symbol: str):
         return result
     except Exception as e:
         return {"error": str(e)}
-
 
 @app.get("/prices")
 def get_prices(symbols: str):
@@ -104,16 +97,14 @@ def get_prices(symbols: str):
                 results[sym] = {"error": "not found"}
                 continue
             price = round(float(hist["Close"].iloc[-1]), 2)
-            prev  = round(float(hist["Close"].iloc[-2]), 2) if len(hist) >= 2 else price
+            prev = round(float(hist["Close"].iloc[-2]), 2) if len(hist) >= 2 else price
             chg_pct = round(((price - prev) / prev) * 100, 2) if prev else 0
             res = {"symbol": sym, "price": price, "changePct": chg_pct, "change": round(price - prev, 2)}
-            set_cache(f"p_{s}", res)
+            set_cache(f"p_{sym}", res)
             results[sym] = res
         except Exception as e:
             results[sym] = {"error": str(e)}
     return results
-
-
 @app.get("/history/{symbol}")
 def get_history(symbol: str, period: str = "1M"):
     sym = symbol.upper()
@@ -122,7 +113,7 @@ def get_history(symbol: str, period: str = "1M"):
     if cached:
         return cached
     try:
-        period_map = {"1M":"1mo","6M":"6mo","YTD":"ytd","1Y":"1y","5Y":"5y"}
+        period_map = {"1M": "1mo", "6M": "6mo", "YTD": "ytd", "1Y": "1y", "5Y": "5y"}
         yf_period = period_map.get(period.upper(), "1mo")
         hist = fetch_yf(sym, yf_period)
         if hist is None or hist.empty:
@@ -133,39 +124,3 @@ def get_history(symbol: str, period: str = "1M"):
         return result
     except Exception as e:
         return {"error": str(e)}
-
-
-@app.get("/news/{symbol}")
-async def get_news(symbol: str, name: str = ""):
-    cache_key = f"news_{symbol.upper()}"
-    cached = get_cache(cache_key, ttl=1800)
-    if cached:
-        return cached
-    try:
-        query = f"{symbol} {name} stock".strip()
-        url = f"https://newsapi.org/v2/everything?q={query}&language=en&sortBy=publishedAt&pageSize=8&apiKey={NEWS_API_KEY}"
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url)
-            data = r.json()
-        if data.get("status") == "ok":
-            articles = [{"title":a.get("title",""),"description":a.get("description",""),"url":a.get("url",""),"urlToImage":a.get("urlToImage",""),"publishedAt":a.get("publishedAt",""),"source":a.get("source",{}).get("name","")} for a in data.get("articles",[])]
-            result = {"symbol": symbol.upper(), "articles": articles}
-            set_cache(cache_key, result)
-            return result
-        return {"error": data.get("message","NewsAPI error"), "articles": []}
-    except Exception as e:
-        return {"error": str(e), "articles": []}
-
-
-# Keep-alive
-def _self_ping():
-    _time.sleep(60)
-    while True:
-        try:
-            urllib.request.urlopen("https://stockvision-api-ol23.onrender.com/ping", timeout=10)
-            print("ping OK", flush=True)
-        except Exception as e:
-            print(f"ping failed: {e}", flush=True)
-        _time.sleep(4 * 60)
-
-threading.Thread(target=_self_ping, daemon=True).
