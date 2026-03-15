@@ -83,7 +83,7 @@ async def get_price(symbol: str):
 @app.get("/prices")
 async def get_prices(symbols: str):
     """ดึงราคาหลายตัวพร้อมกัน — ใช้ batch API = 1 call แทน N calls"""
-    sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()][:20]  # จำกัด 20 ตัว
+    sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()][:60]  # รองรับถึง 60 ตัว
     results = {}
     uncached = []
 
@@ -95,40 +95,46 @@ async def get_prices(symbols: str):
             uncached.append(s)
 
     if uncached:
-        try:
-            # Twelve Data batch quote — 1 API call สำหรับทุกตัว
-            data = await td_get("/quote", {"symbol": ",".join(uncached)})
+        # แบ่งเป็น chunk ละ 30 ตัว เพื่อป้องกัน Twelve Data limit per request
+        import asyncio
+        async def fetch_chunk(chunk):
+            try:
+                data = await td_get("/quote", {"symbol": ",".join(chunk)})
+                if len(chunk) == 1:
+                    items = {chunk[0]: data}
+                else:
+                    items = data if isinstance(data, dict) else {}
+                chunk_results = {}
+                for sym, d in items.items():
+                    sym = sym.upper()
+                    if not isinstance(d, dict) or d.get("status") == "error":
+                        chunk_results[sym] = {"error": d.get("message", "not found") if isinstance(d, dict) else "error"}
+                        continue
+                    try:
+                        price = round(float(d["close"]), 2)
+                        prev = round(float(d["previous_close"]), 2)
+                        change = round(price - prev, 2)
+                        chg_pct = round(((price - prev) / prev) * 100, 2) if prev else 0
+                        res = {
+                            "symbol": sym,
+                            "price": price,
+                            "changePct": chg_pct,
+                            "change": change,
+                            "is_market_open": d.get("is_market_open", False),
+                        }
+                        set_cache(f"p_{sym}", res)
+                        chunk_results[sym] = res
+                    except Exception:
+                        chunk_results[sym] = {"error": "parse error"}
+                return chunk_results
+            except Exception as e:
+                return {sym: {"error": str(e)} for sym in chunk}
 
-            # ถ้าตัวเดียวจะได้ dict, หลายตัวจะได้ dict of dicts
-            if len(uncached) == 1:
-                items = {uncached[0]: data}
-            else:
-                items = data if isinstance(data, dict) else {}
-
-            for sym, d in items.items():
-                sym = sym.upper()
-                if not isinstance(d, dict) or d.get("status") == "error":
-                    results[sym] = {"error": d.get("message", "not found") if isinstance(d, dict) else "error"}
-                    continue
-                try:
-                    price = round(float(d["close"]), 2)
-                    prev = round(float(d["previous_close"]), 2)
-                    change = round(price - prev, 2)
-                    chg_pct = round(((price - prev) / prev) * 100, 2) if prev else 0
-                    res = {
-                        "symbol": sym,
-                        "price": price,
-                        "changePct": chg_pct,
-                        "change": change,
-                        "is_market_open": d.get("is_market_open", False),
-                    }
-                    set_cache(f"p_{sym}", res)
-                    results[sym] = res
-                except Exception:
-                    results[sym] = {"error": "parse error"}
-        except Exception as e:
-            for sym in uncached:
-                results[sym] = {"error": str(e)}
+        # แบ่ง chunk ละ 30 แล้วดึงพร้อมกัน
+        chunks = [uncached[i:i+30] for i in range(0, len(uncached), 30)]
+        chunk_results_list = await asyncio.gather(*[fetch_chunk(c) for c in chunks])
+        for cr in chunk_results_list:
+            results.update(cr)
 
     return results
 
