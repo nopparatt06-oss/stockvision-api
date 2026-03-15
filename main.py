@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
@@ -54,7 +55,7 @@ def ping():
 async def get_price(symbol: str):
     sym = symbol.upper()
     # cache 5 นาที — ประหยัด quota
-    cached = get_cache(f"p_{sym}", ttl=300)
+    cached = get_cache(f"p_{sym}", ttl=600)
     if cached:
         return cached
     try:
@@ -88,7 +89,7 @@ async def get_prices(symbols: str):
     uncached = []
 
     for s in sym_list:
-        c = get_cache(f"p_{s}", ttl=300)
+        c = get_cache(f"p_{s}", ttl=600)
         if c:
             results[s] = c
         else:
@@ -96,7 +97,6 @@ async def get_prices(symbols: str):
 
     if uncached:
         # แบ่งเป็น chunk ละ 30 ตัว เพื่อป้องกัน Twelve Data limit per request
-        import asyncio
         async def fetch_chunk(chunk):
             try:
                 data = await td_get("/quote", {"symbol": ",".join(chunk)})
@@ -131,8 +131,14 @@ async def get_prices(symbols: str):
                 return {sym: {"error": str(e)} for sym in chunk}
 
         # แบ่ง chunk ละ 30 แล้วดึงพร้อมกัน
-        chunks = [uncached[i:i+30] for i in range(0, len(uncached), 30)]
-        chunk_results_list = await asyncio.gather(*[fetch_chunk(c) for c in chunks])
+        chunks = [uncached[i:i+8] for i in range(0, len(uncached), 8)]
+        # ดึง chunk ทีละอัน เพื่อหลีกเลี่ยง rate limit
+        chunk_results_list = []
+        for i, chunk in enumerate(chunks):
+            result = await fetch_chunk(chunk)
+            chunk_results_list.append(result)
+            if i < len(chunks) - 1:
+                await asyncio.sleep(0.3)  # delay 300ms ระหว่าง chunk
         for cr in chunk_results_list:
             results.update(cr)
 
