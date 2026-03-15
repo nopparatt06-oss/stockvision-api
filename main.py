@@ -1,13 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import yfinance as yf
 import httpx
-import requests
 import threading
 import urllib.request
 import time as _time
-import random
 
+TWELVE_API_KEY = "c60bcea00e8a477783a8ac81cd5ba1cc"
 NEWS_API_KEY = "3d7fe42a10054f6ea8e05d93dc4348c7"
 
 app = FastAPI(title="StockVision API")
@@ -27,26 +25,13 @@ def set_cache(key, val):
     _cache[key] = (val, _time.time())
 
 
-def fetch_yf(sym, period="2d", retries=3):
-    for i in range(retries):
-        try:
-            _time.sleep(random.uniform(1.0, 2.5))
-            session = requests.Session()
-            session.headers.update({
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-            })
-            ticker = yf.Ticker(sym, session=session)
-            hist = ticker.history(period=period)
-            if not hist.empty:
-                return hist
-        except Exception as e:
-            if i < retries - 1:
-                _time.sleep(2 ** i)
-            else:
-                raise e
-    return None
+# ── Twelve Data helper ───────────────────────
+async def td_get(path: str, params: dict):
+    params["apikey"] = TWELVE_API_KEY
+    url = f"https://api.twelvedata.com{path}"
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url, params=params)
+        return r.json()
 
 
 @app.get("/")
@@ -60,25 +45,26 @@ def ping():
 
 
 @app.get("/price/{symbol}")
-def get_price(symbol: str):
+async def get_price(symbol: str):
     sym = symbol.upper()
     cached = get_cache(f"p_{sym}", ttl=600)
     if cached:
         return cached
     try:
-        hist = fetch_yf(sym, "2d")
-        if hist is None or hist.empty:
-            return {"error": f"Symbol {sym} not found"}
-        price = round(float(hist["Close"].iloc[-1]), 2)
-        prev = round(float(hist["Close"].iloc[-2]), 2) if len(hist) >= 2 else price
+        data = await td_get("/quote", {"symbol": sym})
+        if data.get("status") == "error" or "code" in data:
+            return {"error": data.get("message", "Symbol not found")}
+        price = round(float(data["close"]), 2)
+        prev = round(float(data["previous_close"]), 2)
+        change = round(price - prev, 2)
         chg_pct = round(((price - prev) / prev) * 100, 2) if prev else 0
         result = {
             "symbol": sym,
             "price": price,
             "prev": prev,
-            "change": round(price - prev, 2),
+            "change": change,
             "changePct": chg_pct,
-            "currency": "USD",
+            "currency": data.get("currency", "USD"),
         }
         set_cache(f"p_{sym}", result)
         return result
@@ -87,7 +73,7 @@ def get_price(symbol: str):
 
 
 @app.get("/prices")
-def get_prices(symbols: str):
+async def get_prices(symbols: str):
     sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     results = {}
     uncached = []
@@ -99,14 +85,15 @@ def get_prices(symbols: str):
             uncached.append(s)
     for sym in uncached:
         try:
-            hist = fetch_yf(sym, "2d")
-            if hist is None or hist.empty:
-                results[sym] = {"error": "not found"}
+            data = await td_get("/quote", {"symbol": sym})
+            if data.get("status") == "error" or "code" in data:
+                results[sym] = {"error": data.get("message", "not found")}
                 continue
-            price = round(float(hist["Close"].iloc[-1]), 2)
-            prev = round(float(hist["Close"].iloc[-2]), 2) if len(hist) >= 2 else price
+            price = round(float(data["close"]), 2)
+            prev = round(float(data["previous_close"]), 2)
+            change = round(price - prev, 2)
             chg_pct = round(((price - prev) / prev) * 100, 2) if prev else 0
-            res = {"symbol": sym, "price": price, "changePct": chg_pct, "change": round(price - prev, 2)}
+            res = {"symbol": sym, "price": price, "changePct": chg_pct, "change": change}
             set_cache(f"p_{sym}", res)
             results[sym] = res
         except Exception as e:
@@ -115,20 +102,33 @@ def get_prices(symbols: str):
 
 
 @app.get("/history/{symbol}")
-def get_history(symbol: str, period: str = "1M"):
+async def get_history(symbol: str, period: str = "1M"):
     sym = symbol.upper()
     cache_key = f"h_{sym}_{period}"
     cached = get_cache(cache_key, ttl=3600)
     if cached:
         return cached
     try:
-        period_map = {"1M": "1mo", "6M": "6mo", "YTD": "ytd", "1Y": "1y", "5Y": "5y"}
-        yf_period = period_map.get(period.upper(), "1mo")
-        hist = fetch_yf(sym, yf_period)
-        if hist is None or hist.empty:
-            return {"error": "No data"}
-        data = [{"date": str(d.date()), "close": round(float(c), 2)} for d, c in zip(hist.index, hist["Close"])]
-        result = {"symbol": sym, "period": period, "data": data}
+        period_map = {
+            "1M": (365, "1month"),
+            "6M": (180, "6month"),
+            "YTD": (365, "ytd"),
+            "1Y": (365, "1year"),
+            "5Y": (260, "5year"),
+        }
+        outputsize, _ = period_map.get(period.upper(), (30, "1month"))
+        interval = "1week" if period.upper() == "5Y" else "1day"
+        data = await td_get("/time_series", {
+            "symbol": sym,
+            "interval": interval,
+            "outputsize": outputsize,
+            "order": "ASC",
+        })
+        if data.get("status") == "error" or "code" in data:
+            return {"error": data.get("message", "No data")}
+        values = data.get("values", [])
+        chart_data = [{"date": v["datetime"], "close": round(float(v["close"]), 2)} for v in values]
+        result = {"symbol": sym, "period": period, "data": chart_data}
         set_cache(cache_key, result)
         return result
     except Exception as e:
