@@ -62,8 +62,13 @@ async def get_price(symbol: str):
             data = r.json()
 
         q = data.get("Global Quote", {})
+        print(f"AV response for {sym}: {data}", flush=True)
         if not q or not q.get("05. price"):
-            return {"error": f"Symbol {sym} not found"}
+            # Check if rate limited
+            if "Information" in data or "Note" in data:
+                msg = data.get("Information", data.get("Note", "Rate limited"))
+                return {"error": f"Rate limited: {msg[:100]}"}
+            return {"error": f"Symbol {sym} not found", "raw": str(data)[:200]}
 
         price = round(float(q["05. price"]), 2)
         prev = round(float(q["08. previous close"]), 2)
